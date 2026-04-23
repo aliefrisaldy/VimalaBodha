@@ -1,70 +1,42 @@
 import io
-import os
 from pathlib import Path
+from typing import List
 
 import torch
-import torch.nn as nn
-from torchvision import models, transforms
+from torchvision import transforms
 from PIL import Image
-from typing import List
+
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-# ── MODEL_PATH: pakai path relatif agar jalan di Railway ──────────────────────
+# ── PATH ───────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
-MODEL_PATH = BASE_DIR / "model.pth"
+MODEL_PATH = BASE_DIR / "model_traced.pt"  # 🔥 pakai TorchScript
 
-DEFAULT_CLASS_NAMES = [
-    "battery", "biological", "cardboard", "clothes", "glass",
-    "metal", "paper", "plastic", "shoes", "trash",
+# ── CLASS NAMES ────────────────────────────────────────────────────────────────
+CLASS_NAMES = [
+    "battery", "biological", "cardboard", "clothes",
+    "glass", "metal", "paper", "plastic", "shoes", "trash",
 ]
 
+# ── CONFIG ─────────────────────────────────────────────────────────────────────
 IMG_SIZE = 224
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def load_model():
-    checkpoint = torch.load(MODEL_PATH, map_location=device)
+# 🔥 Optional: stabilkan performa CPU kecil
+torch.set_num_threads(1)
 
-    if isinstance(checkpoint, dict) and "class_names" in checkpoint:
-        class_names = checkpoint["class_names"]
-        print(f"✅  Class names dari checkpoint: {class_names}")
-    else:
-        class_names = DEFAULT_CLASS_NAMES
-        print(f"⚠️  class_names tidak ada di checkpoint, pakai default.")
-
-    num_classes = len(class_names)
-
-    net = models.resnet50(weights=None)
-    net.fc = nn.Linear(net.fc.in_features, num_classes)
-    net = net.to(device)
-
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        state_dict = checkpoint["model_state_dict"]
-    elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
-    else:
-        state_dict = checkpoint
-
-    net.load_state_dict(state_dict)
-    net.eval()
-    return net, class_names
-
+# ── LOAD MODEL (TorchScript) ───────────────────────────────────────────────────
 try:
-    model, CLASS_NAMES = load_model()
-    print(f"✅  Model loaded — {len(CLASS_NAMES)} classes, device={device}")
-except FileNotFoundError:
-    print(f"❌  File tidak ditemukan: {MODEL_PATH}")
-    model, CLASS_NAMES = None, DEFAULT_CLASS_NAMES
-except RuntimeError as exc:
-    print(f"❌  RuntimeError: {exc}")
-    model, CLASS_NAMES = None, DEFAULT_CLASS_NAMES
-except Exception as exc:
-    print(f"❌  {type(exc).__name__}: {exc}")
-    model, CLASS_NAMES = None, DEFAULT_CLASS_NAMES
+    model = torch.jit.load(MODEL_PATH, map_location=device)
+    model.eval()
+    print(f"✅ TorchScript model loaded! device={device}")
+except Exception as e:
+    print(f"❌ Gagal load model: {e}")
+    model = None
 
-# ── Preprocessing ──────────────────────────────────────────────────────────────
+# ── PREPROCESS ─────────────────────────────────────────────────────────────────
 preprocess = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
@@ -72,10 +44,13 @@ preprocess = transforms.Compose([
                          std=[0.229, 0.224, 0.225]),
 ])
 
-# ── FastAPI ────────────────────────────────────────────────────────────────────
+# ── FASTAPI ────────────────────────────────────────────────────────────────────
 app = FastAPI(title="WasteVision API", version="1.0.0")
+
+# Static files (CSS, JS, dll)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
+# ── ROUTE: FRONTEND ────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
     html_path = BASE_DIR / "index.html"
@@ -83,47 +58,66 @@ async def serve_frontend():
         raise HTTPException(status_code=404, detail="index.html tidak ditemukan.")
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
-
+# ── ROUTE: CLASSIFY ────────────────────────────────────────────────────────────
 @app.post("/classify")
 async def classify_image(files: List[UploadFile] = File(...)):
     if len(files) > 5:
-        raise HTTPException(status_code=400, detail="Maksimal 5 gambar yang bisa diunggah sekaligus.")
+        raise HTTPException(status_code=400, detail="Maksimal 5 gambar.")
 
     if model is None:
-        raise HTTPException(status_code=503, detail="Model belum berhasil dimuat. Cek terminal server.")
+        raise HTTPException(status_code=503, detail="Model belum siap.")
 
     results = []
 
     for file in files:
+        # Validasi format
         if file.content_type not in ("image/jpeg", "image/png", "image/webp"):
-            raise HTTPException(status_code=400, detail=f"File {file.filename} bukan format gambar yang didukung (Hanya JPG, PNG, WEBP).")
+            raise HTTPException(
+                status_code=400,
+                detail=f"{file.filename} bukan format valid (JPG/PNG/WEBP)."
+            )
 
+        # Validasi ukuran
         raw = await file.read()
         if len(raw) > 5 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail=f"File {file.filename} terlalu besar. Maksimum 5 MB.")
+            raise HTTPException(
+                status_code=400,
+                detail=f"{file.filename} terlalu besar (maks 5MB)."
+            )
 
+        # Load image
         try:
             img = Image.open(io.BytesIO(raw)).convert("RGB")
         except Exception:
-            raise HTTPException(status_code=400, detail=f"Gambar {file.filename} tidak bisa dibaca.")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Gambar {file.filename} tidak bisa dibaca."
+            )
 
+        # Preprocess
         tensor = preprocess(img).unsqueeze(0).to(device)
 
-        with torch.no_grad():
+        # 🔥 INFERENCE CEPAT
+        with torch.inference_mode():
             logits = model(tensor)
-            probs  = torch.softmax(logits, dim=1)[0]
+            probs = torch.softmax(logits, dim=1)[0]
 
+        # Top 3
         top3_values, top3_indices = torch.topk(probs, 3)
+
         top3 = [
-            {"label": CLASS_NAMES[idx.item()], "confidence": round(val.item() * 100, 2)}
+            {
+                "label": CLASS_NAMES[idx.item()],
+                "confidence": round(val.item() * 100, 2)
+            }
             for val, idx in zip(top3_values, top3_indices)
         ]
 
         results.append({
             "filename": file.filename,
             "predicted_label": top3[0]["label"],
-            "confidence":      top3[0]["confidence"],
-            "top3":            top3,
+            "confidence": top3[0]["confidence"],
+            "top3": top3,
         })
 
     return JSONResponse({"results": results})
